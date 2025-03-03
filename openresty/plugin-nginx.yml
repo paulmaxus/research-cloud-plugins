@@ -1,0 +1,228 @@
+---
+- name: Install and configure nginx
+  hosts: all
+  gather_facts: true
+
+  tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        timeout: 300
+
+    - name: Gather facts for first time
+      setup:
+
+    - name: Install required packages other distros
+      when: ansible_facts["distribution_major_version"] != "7" and ansible_distribution != 'CentOS'
+      package:
+        name:
+        - nginx
+        - snapd
+        state: present
+
+    - name: Install required packages CentOS 7
+      when: ansible_facts["distribution_major_version"] == "7" and ansible_distribution == 'CentOS'
+      package:
+        name:
+        - nginx
+        - snapd
+        state: present
+
+    - name: Ensure snapd is enabled
+      systemd:
+        name: snapd.socket
+        enabled: true
+        state: started
+      tags:
+        prod
+
+    - name: Enable classic snap support
+      file:
+        src: /var/lib/snapd/snap
+        dest: /snap
+        state: link
+      when: ansible_os_family != "Debian"
+      tags:
+        prod
+
+    - name: Update snap after install
+      shell: snap install core; snap refresh core
+      changed_when: true
+      failed_when: false
+      tags:
+        prod
+
+    - name: Install certbot
+      snap:
+        name: certbot
+        classic: yes
+      tags:
+        prod
+
+    - name: Symlink certbot into place
+      file:
+        src: /snap/bin/certbot
+        dest: /usr/bin/certbot
+        state: link
+      tags:
+        prod
+
+    - name: Create app location config dir
+      file:
+        path: /etc/nginx/app-location-conf.d
+        state: directory
+        mode: '0755'
+        recurse: yes
+
+    - name: Add authentication.conf
+      copy:
+        # src: nginx/conf.d/authentication.conf
+        dest: /etc/nginx/app-location-conf.d/authentication.conf
+        mode: 0644
+        content: |
+          location @custom_401 {
+            internal;
+
+              if ($cookie_redirecturi = "") {
+                add_header Set-Cookie "redirecturi=$request_uri;path=/oauth2_callback;Max-Age=300;";
+              }
+
+            return 302 "{{rsc_nginx_authorization_endpoint}}?client_id={{ rsc_nginx_oauth2_application.client_id if rsc_nginx_oauth2_application != '' else default('') }}&redirect_uri=$scheme://$http_host/oauth2_callback&response_type=token&scope=openid&response_format=query_param";
+          }
+
+          location = /oauth2_callback {
+            add_header Content-Type text/html;
+
+            set $access_token "";
+            set $exires_in 43200;
+          
+            if ($args ~* "access_token=(\w+)") {
+              set $access_token $1;
+            }
+          
+            if ($args ~* "expires_in=(\w+)") {
+              set $expires_in $1;
+            }
+          
+            if ($access_token ~ "^$") {
+              return 403 "Unauthorized";
+            } 
+
+            set $redirectpath "/";
+          
+            add_header Set-Cookie "Authorization=$access_token;Path=/;Max-Age=$expires_in";
+            add_header Set-Cookie "redirecturi=;Path=/oauth2_callback;expires=Thu, 01 Jan 1970 00:00:00 GMT;";
+
+            if ($cookie_redirecturi) {
+              set $redirectpath $cookie_redirecturi;
+            }
+
+            return 302 $scheme://$host$redirectpath;
+          }
+
+          location = /logout {
+            add_header Content-Type text/html;
+            add_header Set-Cookie "Authorization=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+            add_header Set-Cookie "redirecturi=;Path=/oauth2_callback;Max-Age=0";
+
+            return 200 'User logged out !';
+          }
+
+          location = /test {
+              error_page 401 = @custom_401;
+              auth_request /validate;
+              auth_request_set $username $upstream_http_username;
+              proxy_set_header REMOTE_USER $username;
+          }
+
+          location = /validate {
+            internal;
+            add_header Content-Type text/plain;
+            if ($cookie_authorization ~ "^$") {
+              return 401;
+            }
+
+            proxy_pass {{ rsc_nginx_user_info_endpoint }};
+            proxy_pass_request_body off;
+            proxy_set_header   Content-Length "";
+            proxy_set_header   Accept application/json;
+            proxy_set_header   Authorization $cookie_authorization;
+          }
+      tags:
+        prod
+
+    - name: Add map directive
+      copy:
+        src: nginx/conf.d/map-upgrade.conf
+        dest: /etc/nginx/conf.d/map-upgrade.conf
+        mode: 0644
+
+    - name: Copy nginx config
+      #template:
+      copy:
+        src: files/nginx/conf.d/ssl_main.conf
+        dest: /etc/nginx/conf.d/ssl_main.conf
+        mode: 0644
+      
+    - name: Remove default nginx config
+      file:
+        dest: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Increase server name hash bucket size to 128
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        state: present
+        firstmatch: true
+        insertafter: '^http \{$'
+        line: '    server_names_hash_bucket_size 128;'
+
+    - name: Unlimited client max body size 
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        state: present
+        firstmatch: true
+        insertafter: '^http \{$'
+        line: '    client_max_body_size 0;'
+
+    - name: Remove potential duplicate listen configs
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: "^\\w*listen[^;]*;" 
+        state: absent                
+
+    - name: Make sure nginx is enabled
+      service:
+        name: nginx
+        enabled: yes
+    
+    - name: Make sure nginx is started
+      service:
+        name: nginx
+        state: started
+      register: nginx_service_started
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+      tags:
+        prod
+
+    - name: certbot test
+      command: curl {{ rsc_nginx_service_url }}
+      tags:
+        prod
+
+    - name: Run Certbot
+      command:  certbot --nginx -n --agree-tos --register-unsafely-without-email  -d {{ rsc_nginx_service_url }}
+      tags:
+        prod
+
+    - name: Create certbot cron job
+      cron:
+        name: "Renew the certificate"
+        minute: "0"
+        hour: "12"
+        job: "/usr/bin/certbot renew --quiet"
+      tags:
+        prod

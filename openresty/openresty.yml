@@ -1,0 +1,224 @@
+---
+- name: Install and configure OpenResty
+  hosts: all
+  gather_facts: true
+
+  tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        timeout: 300
+
+    - name: Gather facts for first time
+      setup:
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - software-properties-common
+          - snapd
+        state: present
+
+    - name: Add OpenResty GPG key
+      apt_key:
+        url: "https://openresty.org/package/pubkey.gpg"
+        state: present
+
+    - name: Add OpenResty repository
+      apt_repository:
+        repo: "deb http://openresty.org/package/ubuntu {{ ansible_lsb.codename }} main"
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install OpenResty
+      apt:
+        name: openresty
+        state: present
+
+    - name: Start and enable OpenResty service
+      systemd:
+        name: openresty
+        state: started
+        enabled: yes
+
+    - name: Verify OpenResty installation
+      command: openresty -v
+      register: openresty_version
+
+    - name: Display OpenResty version
+      debug:
+        msg: "OpenResty version installed: {{ openresty_version.stdout }}"
+
+    - name: Ensure snapd is enabled
+      systemd:
+        name: snapd.socket
+        enabled: true
+        state: started
+    
+    - name: Update snap after install
+      shell: snap install core; snap refresh core
+      changed_when: true
+      failed_when: false
+    
+    - name: Install certbot
+      snap:
+        name: certbot
+        classic: yes
+    
+    - name: Symlink certbot into place
+      file:
+        src: /snap/bin/certbot
+        dest: /usr/bin/certbot
+        state: link
+    
+    - name: Create app location config dir
+      file:
+        path: /etc/openresty/app-location-conf.d
+        state: directory
+        mode: '0755'
+        recurse: yes
+
+    - name: Add authentication.conf
+      copy:
+        # src: nginx/conf.d/authentication.conf
+        dest: /etc/nginx/app-location-conf.d/authentication.conf
+        mode: 0644
+        content: |
+          location @custom_401 {
+            internal;
+
+              if ($cookie_redirecturi = "") {
+                add_header Set-Cookie "redirecturi=$request_uri;path=/oauth2_callback;Max-Age=300;";
+              }
+
+            return 302 "{{rsc_nginx_authorization_endpoint}}?client_id={{ rsc_nginx_oauth2_application.client_id if rsc_nginx_oauth2_application != '' else default('') }}&redirect_uri=$scheme://$http_host/oauth2_callback&response_type=token&scope=openid&response_format=query_param";
+          }
+
+          location = /oauth2_callback {
+            add_header Content-Type text/html;
+
+            set $access_token "";
+            set $exires_in 43200;
+          
+            if ($args ~* "access_token=(\w+)") {
+              set $access_token $1;
+            }
+          
+            if ($args ~* "expires_in=(\w+)") {
+              set $expires_in $1;
+            }
+          
+            if ($access_token ~ "^$") {
+              return 403 "Unauthorized";
+            } 
+
+            set $redirectpath "/";
+          
+            add_header Set-Cookie "Authorization=$access_token;Path=/;Max-Age=$expires_in";
+            add_header Set-Cookie "redirecturi=;Path=/oauth2_callback;expires=Thu, 01 Jan 1970 00:00:00 GMT;";
+
+            if ($cookie_redirecturi) {
+              set $redirectpath $cookie_redirecturi;
+            }
+
+            return 302 $scheme://$host$redirectpath;
+          }
+
+          location = /logout {
+            add_header Content-Type text/html;
+            add_header Set-Cookie "Authorization=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+            add_header Set-Cookie "redirecturi=;Path=/oauth2_callback;Max-Age=0";
+
+            return 200 'User logged out !';
+          }
+
+          location = /test {
+              error_page 401 = @custom_401;
+              auth_request /validate;
+              auth_request_set $username $upstream_http_username;
+              proxy_set_header REMOTE_USER $username;
+          }
+
+          location = /validate {
+            internal;
+            add_header Content-Type text/plain;
+            if ($cookie_authorization ~ "^$") {
+              return 401;
+            }
+
+            proxy_pass {{ rsc_nginx_user_info_endpoint }};
+            proxy_pass_request_body off;
+            proxy_set_header   Content-Length "";
+            proxy_set_header   Accept application/json;
+            proxy_set_header   Authorization $cookie_authorization;
+          }
+      tags:
+        prod
+
+    - name: Create confd location config dir
+      file:
+        path: /etc/openresty/conf.d
+        state: directory
+        mode: '0755'
+        recurse: yes
+
+    - name: Add map directive
+      copy:
+        src: nginx/conf.d/map-upgrade.conf
+        dest: /etc/openresty/conf.d/map-upgrade.conf
+        mode: 0644
+
+    - name: Copy nginx config
+      copy:
+        src: files/nginx/nginx.conf
+        dest: /etc/openresty/nginx.conf
+        mode: 0644
+
+    - name: Copy nginx config ssl
+      #template:
+      copy:
+        src: files/nginx/conf.d/ssl_main.conf
+        dest: /etc/openresty/conf.d/ssl_main.conf
+        mode: 0644
+      
+    #- name: Remove default nginx config
+    #  file:
+    #    dest: /etc/openresty/sites-enabled/default
+    #    state: absent
+
+    - name: Make sure nginx is enabled
+      service:
+        name: openresty
+        enabled: yes
+    
+    - name: Make sure nginx is started
+      service:
+        name: openresty
+        state: started
+      register: openresty_service_started
+
+    - name: Reload nginx
+      service:
+        name: openresty
+        state: reloaded
+
+    - name: certbot test
+      command: curl {{ rsc_nginx_service_url }}
+      tags:
+        prod
+
+    - name: Run Certbot
+      command:  certbot --nginx -n --agree-tos --register-unsafely-without-email  -d {{ rsc_nginx_service_url }}
+      tags:
+        prod
+
+    - name: Create certbot cron job
+      cron:
+        name: "Renew the certificate"
+        minute: "0"
+        hour: "12"
+        job: "/usr/bin/certbot renew --quiet"
+      tags:
+        prod
