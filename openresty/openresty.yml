@@ -1,6 +1,6 @@
 ---
 - name: Install and configure OpenResty
-  hosts: all
+  hosts: localhost
   gather_facts: true
 
   tasks:
