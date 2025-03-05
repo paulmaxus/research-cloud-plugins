@@ -63,7 +63,7 @@
 - name: Add authentication.conf
   copy:
     # src: nginx/conf.d/authentication.conf
-    dest: /etc/nginx/app-location-conf.d/authentication.conf
+    dest: /etc/openresty/app-location-conf.d/authentication.conf
     mode: 0644
     content: |
       location @custom_401 {
