@@ -179,26 +179,26 @@
     state: started
   register: openresty_service_started
 
-- name: Reload nginx
-  service:
-    name: openresty
-    state: reloaded
+#- name: Reload nginx
+#  service:
+#    name: openresty
+#    state: reloaded
 
-- name: certbot test
-  command: curl {{ rsc_nginx_service_url }}
-  tags:
-    prod
+#- name: certbot test
+#  command: curl {{ rsc_nginx_service_url }}
+#  tags:
+#    prod
 
-- name: Run Certbot
-  command:  certbot --nginx -n --agree-tos --register-unsafely-without-email  -d {{ rsc_nginx_service_url }}
-  tags:
-    prod
+#- name: Run Certbot
+#  command:  certbot --nginx -n --agree-tos --register-unsafely-without-email  -d {{ rsc_nginx_service_url }}
+#  tags:
+#    prod
 
-- name: Create certbot cron job
-  cron:
-    name: "Renew the certificate"
-    minute: "0"
-    hour: "12"
-    job: "/usr/bin/certbot renew --quiet"
-  tags:
-    prod
+#- name: Create certbot cron job
+#  cron:
+#    name: "Renew the certificate"
+#    minute: "0"
+#    hour: "12"
+#    job: "/usr/bin/certbot renew --quiet"
+#  tags:
+#    prod
